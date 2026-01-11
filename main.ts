@@ -1,6 +1,6 @@
-import { Hono } from "https://deno.land/x/hono@v3.12.11/mod.ts";
-import { cors } from "https://deno.land/x/hono@v3.12.11/middleware.ts";
-import { upgradeWebSocket } from "https://deno.land/x/hono@v3.12.11/adapter/deno/websocket.ts";
+import { Hono } from "npm:hono";
+import { cors } from "npm:hono/cors";
+import { upgradeWebSocket } from "npm:hono/deno";
 
 const app = new Hono();
 
