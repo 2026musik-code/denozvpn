@@ -13,9 +13,6 @@ const APP_PORT = Deno.env.get("PORT") || "8000";
 const UDP_PORT = Deno.env.get("UDP_PORT") || "7300";
 const DOMAIN = Deno.env.get("DOMAIN") || "zivpn.example.com";
 
-// Database (Deno KV)
-const kv = await Deno.openKv();
-
 // Types
 interface User {
   id: string;
@@ -25,6 +22,70 @@ interface User {
   usage: number; // in bytes
   expiry: number; // timestamp
   created_at: number;
+}
+
+// --- DATABASE ABSTRACTION ---
+interface UserStorage {
+  getUsers(): Promise<User[]>;
+  createUser(user: User): Promise<void>;
+  deleteUser(id: string): Promise<void>;
+}
+
+class KvStorage implements UserStorage {
+  private kv: Deno.Kv;
+
+  constructor(kv: Deno.Kv) {
+    this.kv = kv;
+  }
+
+  async getUsers(): Promise<User[]> {
+    const usersIter = this.kv.list({ prefix: ["users"] });
+    const users: User[] = [];
+    for await (const entry of usersIter) {
+      users.push(entry.value as User);
+    }
+    return users;
+  }
+
+  async createUser(user: User): Promise<void> {
+    await this.kv.set(["users", user.id], user);
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    await this.kv.delete(["users", id]);
+  }
+}
+
+class MemoryStorage implements UserStorage {
+  private users = new Map<string, User>();
+
+  async getUsers(): Promise<User[]> {
+    return Array.from(this.users.values());
+  }
+
+  async createUser(user: User): Promise<void> {
+    this.users.set(user.id, user);
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    this.users.delete(id);
+  }
+}
+
+// Initialize Storage with Fallback
+let storage: UserStorage;
+try {
+  // Check if Deno.openKv exists and is a function
+  if (typeof Deno.openKv === "function") {
+      const kv = await Deno.openKv();
+      storage = new KvStorage(kv);
+      console.log("Database: Deno KV (Persistent)");
+  } else {
+      throw new Error("Deno.openKv is not available");
+  }
+} catch (e) {
+  console.warn("Database: In-Memory (Non-persistent). Reason:", e);
+  storage = new MemoryStorage();
 }
 
 // --- API ROUTES ---
@@ -38,7 +99,7 @@ const authMiddleware = async (c: any, next: any) => {
   await next();
 };
 
-// 1. Login (Just validates password on client side mostly, but here for check)
+// 1. Login
 app.post('/api/login', async (c) => {
   const body = await c.req.json();
   if (body.password === ADMIN_PASSWORD) {
@@ -49,17 +110,15 @@ app.post('/api/login', async (c) => {
 
 // 2. Get Dashboard Stats
 app.get('/api/stats', authMiddleware, async (c) => {
-  const usersIter = kv.list({ prefix: ["users"] });
-  let userCount = 0;
+  const users = await storage.getUsers();
+  let userCount = users.length;
   let totalUsage = 0;
 
-  for await (const entry of usersIter) {
-    userCount++;
-    const user = entry.value as User;
+  for (const user of users) {
     totalUsage += user.usage || 0;
   }
 
-  // Mock system stats since Deno Deploy doesn't give full sys access
+  // Mock system stats
   const sysLoad = Math.random() * 20 + 10;
 
   return c.json({
@@ -91,12 +150,9 @@ app.post('/api/users', authMiddleware, async (c) => {
     created_at: Date.now()
   };
 
-  await kv.set(["users", id], newUser);
+  await storage.createUser(newUser);
 
   // Generate ZiVPN Config
-  // Format: zivpn://username:password@host:port?param=value...
-  // Usually these are custom JSONs or URI schemes. I will provide a standard V2Ray-like JSON structure often used wrapped in ZiVPN.
-
   const config = {
     remarks: username,
     server: DOMAIN,
@@ -116,46 +172,37 @@ app.post('/api/users', authMiddleware, async (c) => {
 
 // 4. List Users
 app.get('/api/users', authMiddleware, async (c) => {
-  const usersIter = kv.list({ prefix: ["users"] });
-  const users = [];
-  for await (const entry of usersIter) {
-    users.push(entry.value);
-  }
+  const users = await storage.getUsers();
   return c.json({ users });
 });
 
 // 5. Delete User
 app.delete('/api/users/:id', authMiddleware, async (c) => {
   const id = c.req.param('id');
-  await kv.delete(["users", id]);
+  await storage.deleteUser(id);
   return c.json({ success: true });
 });
 
 // --- WEBSOCKET TUNNEL (Mock/Shim) ---
 // Since real UDP isn't supported, we use a WebSocket endpoint that apps often use as fallback
 app.get('/zivpn-tunnel', upgradeWebSocket((c) => {
-  let userId: string | null = null;
   return {
     onOpen(event, ws) {
-      // In a real implementation, this would handle VLESS/VMESS over WS
-      // For this script, it accepts connections to simulate "Working" status
       activeConnections.add(ws);
+      // Attach cleanup to the websocket instance itself or use a Map
+      ws.onclose = () => activeConnections.delete(ws);
     },
-    async onMessage(event, ws) {
-      // Simulate Traffic Counting
-      // In a real world, you'd parse the VLESS header to find the UUID (User ID)
-      // Here we just increment a global counter or a random user for demonstration if we knew them
-      // For now, we just echo back to keep connection alive
-      // ws.send(event.data);
-
-      // Simulating data usage update (randomly picking a user for demo purposes if we don't have auth on WS)
-      // In production, authentication happens during the WS handshake or first packet.
+    onMessage(event, ws) {
+       // ...
     },
     onClose: () => {
-       activeConnections.delete(ws);
-    },
+       // This might be called by the adapter, but if we attach manual listener above it works too.
+       // Or we can just leave this empty if we used ws.onclose.
+    }
   };
 }));
+
+
 // Helper set to track approximate active connections
 const activeConnections = new Set<any>();
 
